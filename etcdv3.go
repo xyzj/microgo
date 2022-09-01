@@ -128,6 +128,58 @@ func NewEtcdv3ClientTLS(etcdaddr []string, certfile, keyfile, cafile, username, 
 	return m, nil
 }
 
+// WriteInfo 单次写入信息，不维护
+func (m *Etcdv3Client) WriteInfo(key string, ei *EtcdInfo) error {
+	defer func() {
+		if err := recover(); err != nil {
+			m.logger.Error("etcd write error: " + errors.WithStack(err.(error)).Error())
+		}
+	}()
+	detail, _ := json.MarshalToString(ei)
+	// 注册
+	var err error
+	var leaseGrantResp *clientv3.LeaseGrantResponse
+	var lease clientv3.Lease
+	var leaseid clientv3.LeaseID
+	// RUN:
+	if m.etcdClient.ActiveConnection() == nil {
+		return fmt.Errorf("connection not active")
+	}
+	lease = clientv3.NewLease(m.etcdClient)
+	if leaseGrantResp, err = lease.Grant(context.Background(), leaseTimeout); err != nil {
+		m.logger.Error(fmt.Sprintf("Create lease error: %s", err.Error()))
+		return fmt.Errorf("create lease error: %s", err.Error())
+	}
+	leaseid = leaseGrantResp.ID
+	_, err = m.etcdClient.Put(context.Background(), key, detail, clientv3.WithLease(leaseid))
+	if err != nil {
+		m.logger.Error(fmt.Sprintf("Registration to %s failed: %v", m.etcdAddr, err.Error()))
+		return fmt.Errorf("registration to %s failed: %v", m.etcdAddr, err.Error())
+	}
+	return nil
+}
+
+// GetServers 返回所有服务数据
+func (m *Etcdv3Client) GetServers() (map[string]string, error) {
+	defer func() {
+		if err := recover(); err != nil {
+			m.logger.Error("etcd list error: " + errors.WithStack(err.(error)).Error())
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
+	resp, err := m.etcdClient.Get(ctx, fmt.Sprintf("/%s/", m.etcdRoot), clientv3.WithPrefix())
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	var mapsvr = make(map[string]string)
+	// 重新添加
+	for _, v := range resp.Kvs {
+		mapsvr[gopsu.String(v.Key)] = gopsu.String(v.Value)
+	}
+	return mapsvr, nil
+}
+
 // listServers 查询根路径下所有服务
 func (m *Etcdv3Client) listServers() error {
 	defer func() error {
