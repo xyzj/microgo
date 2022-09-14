@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/xyzj/gopsu"
 	json "github.com/xyzj/gopsu/json"
+	"github.com/xyzj/gopsu/logger"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -32,14 +33,14 @@ type OptEtcd struct {
 
 // EtcdInfo 注册信息体
 type EtcdInfo struct {
+	TimeConnect int64  `json:"timeConnect"`
+	TimeActive  int64  `json:"timeActive"`
 	IP          string `json:"ip"`
 	Port        string `json:"port"`
 	Name        string `json:"name"`
 	Alias       string `json:"alias"`
 	Intfc       string `json:"INTFC"`
 	Protocol    string `json:"protocol"`
-	TimeConnect int64  `json:"timeConnect"`
-	TimeActive  int64  `json:"timeActive"`
 	Source      string `json:"source"`
 	Fulladdr    string `json:"-"`
 }
@@ -48,25 +49,27 @@ type EtcdInfo struct {
 type Etcdv3Client struct {
 	// etcdLog      *io.Writer       // 日志
 	// etcdLogLevel int              // 日志等级
-	etcdRoot   string           // etcd注册根路经
 	etcdAddr   []string         // etcd服务地址
 	etcdClient *clientv3.Client // 连接实例
-	svrName    string           // 服务名称
 	svrPool    sync.Map         // 线程安全服务信息字典
-	svrDetail  string           // 服务信息
-	logger     gopsu.Logger     //  日志接口
+	logger     logger.Logger    //  日志接口
 	realIP     string           // 所在电脑ip
+	svrDetail  string           // 服务信息
+	svrName    string           // 服务名称
+	etcdRoot   string           // etcd注册根路经
 	etcdKey    string
+	lease      clientv3.Lease
+	leaseid    clientv3.LeaseID
 }
 
 // RegisteredServer 获取到的服务注册信息
 type registeredServer struct {
+	svrActiveTime int64  // 服务查询时间
+	svrPickTimes  int64  // 命中次数
 	svrName       string // 服务名称
 	svrAddr       string // 服务地址
-	svrPickTimes  int64  // 命中次数
 	svrProtocol   string // 服务使用数据格式
 	svrInterface  string // 服务发布的接口类型
-	svrActiveTime int64  // 服务查询时间
 	svrKey        string // 服务注册key
 	svrRealIP     string // 目标服务的本地ip
 	svrAlias      string // 显示用名称
@@ -99,7 +102,7 @@ func NewEtcdv3ClientTLS(etcdaddr []string, certfile, keyfile, cafile, username, 
 	m := &Etcdv3Client{
 		etcdRoot: "micro-svr",
 		etcdAddr: etcdaddr,
-		logger:   &gopsu.NilLogger{},
+		logger:   &logger.NilLogger{},
 	}
 	m.realIP = gopsu.RealIP(false)
 	var tlsconf *tls.Config
@@ -128,42 +131,11 @@ func NewEtcdv3ClientTLS(etcdaddr []string, certfile, keyfile, cafile, username, 
 	return m, nil
 }
 
-// WriteInfo 单次写入信息，不维护
-func (m *Etcdv3Client) WriteInfo(key string, ei *EtcdInfo) error {
-	defer func() {
-		if err := recover(); err != nil {
-			m.logger.Error("etcd write error: " + errors.WithStack(err.(error)).Error())
-		}
-	}()
-	detail, _ := json.MarshalToString(ei)
-	// 注册
-	var err error
-	var leaseGrantResp *clientv3.LeaseGrantResponse
-	var lease clientv3.Lease
-	var leaseid clientv3.LeaseID
-	// RUN:
-	if m.etcdClient.ActiveConnection() == nil {
-		return fmt.Errorf("connection not active")
-	}
-	lease = clientv3.NewLease(m.etcdClient)
-	if leaseGrantResp, err = lease.Grant(context.Background(), leaseTimeout); err != nil {
-		m.logger.Error(fmt.Sprintf("Create lease error: %s", err.Error()))
-		return fmt.Errorf("create lease error: %s", err.Error())
-	}
-	leaseid = leaseGrantResp.ID
-	_, err = m.etcdClient.Put(context.Background(), key, detail, clientv3.WithLease(leaseid))
-	if err != nil {
-		m.logger.Error(fmt.Sprintf("Registration to %s failed: %v", m.etcdAddr, err.Error()))
-		return fmt.Errorf("registration to %s failed: %v", m.etcdAddr, err.Error())
-	}
-	return nil
-}
-
 // GetServers 返回所有服务数据
 func (m *Etcdv3Client) GetServers() (map[string]string, error) {
 	defer func() {
 		if err := recover(); err != nil {
-			m.logger.Error("etcd list error: " + errors.WithStack(err.(error)).Error())
+			m.logger.Error("list error: " + errors.WithStack(err.(error)).Error())
 		}
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
@@ -184,7 +156,7 @@ func (m *Etcdv3Client) GetServers() (map[string]string, error) {
 func (m *Etcdv3Client) listServers() error {
 	defer func() error {
 		if err := recover(); err != nil {
-			m.logger.Error("etcd list error: " + errors.WithStack(err.(error)).Error())
+			m.logger.Error("list error: " + errors.WithStack(err.(error)).Error())
 			return err.(error)
 		}
 		return nil
@@ -315,7 +287,7 @@ func (m *Etcdv3Client) SetRoot(root string) {
 }
 
 // SetLogger 设置日志记录器
-func (m *Etcdv3Client) SetLogger(l gopsu.Logger) {
+func (m *Etcdv3Client) SetLogger(l logger.Logger) {
 	m.logger = l
 	// m.etcdLog = l
 	// m.etcdLogLevel = level
@@ -366,29 +338,28 @@ func (m *Etcdv3Client) Register(opt *OptEtcd) error {
 	// 注册
 	var err error
 	var leaseGrantResp *clientv3.LeaseGrantResponse
-	var lease clientv3.Lease
-	var leaseid clientv3.LeaseID
+	// var leaseid clientv3.LeaseID
 	var keepRespChan <-chan *clientv3.LeaseKeepAliveResponse
 	// RUN:
 	if m.etcdClient.ActiveConnection() == nil {
 		return fmt.Errorf("connection not active")
 	}
 	m.listServers()
-	lease = clientv3.NewLease(m.etcdClient)
+	lease := clientv3.NewLease(m.etcdClient)
 	if leaseGrantResp, err = lease.Grant(context.Background(), leaseTimeout); err != nil {
-		m.logger.Error(fmt.Sprintf("Create lease error: %s", err.Error()))
+		m.logger.Error(fmt.Sprintf("create lease error: %s", err.Error()))
 		return fmt.Errorf("create lease error: %s", err.Error())
 	}
-	leaseid = leaseGrantResp.ID
-	_, err = m.etcdClient.Put(context.Background(), m.etcdKey, m.svrDetail, clientv3.WithLease(leaseid))
+	m.leaseid = leaseGrantResp.ID
+	_, err = m.etcdClient.Put(context.Background(), m.etcdKey, m.svrDetail, clientv3.WithLease(m.leaseid))
 	if err != nil {
-		m.logger.Error(fmt.Sprintf("Registration to %s failed: %v", m.etcdAddr, err.Error()))
+		m.logger.Error(fmt.Sprintf("registration to %s failed: %v", m.etcdAddr, err.Error()))
 		return fmt.Errorf("registration to %s failed: %v", m.etcdAddr, err.Error())
 	}
-	m.logger.System(fmt.Sprintf("Registration to %v as `%s://%s:%s/%s` success.", m.etcdAddr, opt.Interface, opt.Host, opt.Port, opt.Name))
-	keepRespChan, err = lease.KeepAlive(context.Background(), leaseid)
+	m.logger.System(fmt.Sprintf("registration to %v as `%s://%s:%s/%s` success", m.etcdAddr, opt.Interface, opt.Host, opt.Port, opt.Name))
+	keepRespChan, err = lease.KeepAlive(context.Background(), m.leaseid)
 	if err != nil {
-		m.logger.Error(fmt.Sprintf("Keep lease error: %s", err.Error()))
+		m.logger.Error(fmt.Sprintf("keep lease error: %s", err.Error()))
 		return fmt.Errorf("keep lease error: %s", err.Error())
 	}
 	// func() {
@@ -398,7 +369,7 @@ func (m *Etcdv3Client) Register(opt *OptEtcd) error {
 		select {
 		case keepResp := <-keepRespChan:
 			if keepResp == nil {
-				m.logger.Error("Lease failure, try to reboot.")
+				m.logger.Error("lease failure, try to reboot")
 				return fmt.Errorf("lease failure, try to reboot")
 			}
 		case <-t.C:
@@ -409,6 +380,53 @@ func (m *Etcdv3Client) Register(opt *OptEtcd) error {
 	// time.Sleep(time.Duration(rand.Intn(2000)+1500) * time.Millisecond)
 	// goto RUN
 	// return nil
+}
+
+// Delete 删除key
+func (m *Etcdv3Client) Delete(keys []string) {
+	defer func() {
+		if err := recover(); err != nil {
+			m.logger.Error("del keys panic: " + errors.WithStack(err.(error)).Error())
+		}
+	}()
+	// RUN:
+	if m.etcdClient.ActiveConnection() == nil {
+		return
+	}
+	for _, key := range keys {
+		a, _ := m.etcdClient.Delete(context.Background(), key, clientv3.WithPrefix())
+		if a.Deleted > 0 {
+			m.logger.Info("del key: " + key)
+		}
+	}
+}
+
+// WriteMore 一次写入多条信息，使用同一个lease
+func (m *Etcdv3Client) WriteMore(keys []string, eis []*EtcdInfo) {
+	defer func() {
+		if err := recover(); err != nil {
+			m.logger.Error("write more error: " + errors.WithStack(err.(error)).Error())
+		}
+	}()
+	// RUN:
+	if m.etcdClient.ActiveConnection() == nil {
+		return
+	}
+	// 注册
+	var opt clientv3.OpOption
+	var err error
+	if m.leaseid == 0 {
+		return
+	}
+	opt = clientv3.WithLease(m.leaseid)
+	for k, key := range keys {
+		detail, _ := json.MarshalToString(eis[k])
+		_, err = m.etcdClient.Put(context.Background(), key, detail, opt)
+		if err != nil {
+			m.logger.Error(fmt.Sprintf("write to %s failed: %v", m.etcdAddr, err.Error()))
+			return
+		}
+	}
 }
 
 // Watcher 监视服务信息变化
